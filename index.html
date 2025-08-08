@@ -54,6 +54,7 @@
 
     <script>
         let gl, program, positionBuffer, normalBuffer, indexBuffer;
+        let gradientProgram, gradientBuffer; // For gradient background
         let modelMatrix = mat4_identity();
         let viewMatrix = mat4_identity();
         let projectionMatrix = mat4_identity();
@@ -125,6 +126,35 @@
                 gl_FragColor = vec4(finalColor, 1.0);
             }
         `;
+
+        // Simple gradient background shaders
+        const gradientVertexShader = `
+            attribute vec2 a_position;
+            varying vec2 v_position;
+            
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+                v_position = a_position;
+            }
+        `;
+
+        const gradientFragmentShader = `
+            precision mediump float;
+            varying vec2 v_position;
+            
+            void main() {
+                // Create gradient from top to bottom
+                float gradient = (v_position.y + 1.0) * 0.5; // Convert from [-1,1] to [0,1]
+                
+                // Top color (darker blue/purple)
+                vec3 topColor = vec3(0.2, 0.3, 0.5);
+                // Bottom color (lighter, whitish)
+                vec3 bottomColor = vec3(0.8, 0.85, 0.9);
+                
+                vec3 color = mix(bottomColor, topColor, gradient);
+                gl_FragColor = vec4(color, 1.0);
+            }
+        `;
         
         // Initialize WebGL
         function initWebGL() {
@@ -148,14 +178,25 @@
                 updateInfo('❌ Shader compilation failed');
                 return false;
             }
+            
+            // Create gradient background shader program
+            gradientProgram = createShaderProgram(gl, gradientVertexShader, gradientFragmentShader);
+            if (!gradientProgram) {
+                updateInfo('❌ Gradient shader compilation failed');
+                return false;
+            }
+            
             gl.useProgram(program);
             
             // Set up viewport and enable depth testing
             gl.viewport(0, 0, canvas.width, canvas.height);
             gl.enable(gl.DEPTH_TEST);
-            // gl.enable(gl.CULL_FACE);
-            // gl.cullFace(gl.BACK);
-            gl.clearColor(1,0,0,1);
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.BACK);
+            gl.clearColor(0.0, 0.0, 0.0, 1.0); // Clear to black (gradient will cover it)
+            
+            // Create gradient background quad
+            createGradientQuad();
             
             // Set up projection matrix
             const aspect = canvas.width / canvas.height;
@@ -177,6 +218,20 @@
         
         function updateInfo(message) {
             document.getElementById('info').textContent = message;
+        }
+
+        function createGradientQuad() {
+            // Create a full-screen quad for the gradient background
+            const quadVertices = [
+                -1, -1,  // bottom-left
+                 1, -1,  // bottom-right
+                -1,  1,  // top-left
+                 1,  1   // top-right
+            ];
+            
+            gradientBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, gradientBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(quadVertices), gl.STATIC_DRAW);
         }
         
         function setupControls(canvas) {
@@ -566,6 +621,38 @@
         function render() {
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             
+            // 1. Render gradient background first
+            renderGradientBackground();
+            
+            // 2. Render 3D model on top
+            render3DModel();
+            
+            requestAnimationFrame(render);
+        }
+
+        function renderGradientBackground() {
+            // Disable depth testing for background
+            gl.disable(gl.DEPTH_TEST);
+            
+            // Use gradient shader program
+            gl.useProgram(gradientProgram);
+            
+            // Bind and draw the full-screen quad
+            const positionLoc = gl.getAttribLocation(gradientProgram, 'a_position');
+            gl.bindBuffer(gl.ARRAY_BUFFER, gradientBuffer);
+            gl.enableVertexAttribArray(positionLoc);
+            gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+            
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            
+            // Re-enable depth testing for 3D objects
+            gl.enable(gl.DEPTH_TEST);
+        }
+
+        function render3DModel() {
+            // Switch back to 3D shader program
+            gl.useProgram(program);
+            
             // Auto-rotate model
             rotation += 0.005;
             
@@ -622,8 +709,6 @@
                     gl.drawArrays(gl.TRIANGLES, 0, window.vertexCount);
                 }
             }
-            
-            requestAnimationFrame(render);
         }
         
         // Matrix math functions (same as before but more robust)
