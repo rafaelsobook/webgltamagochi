@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debug GLB Loader</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #111;
+            font-family: Arial, sans-serif;
+        }
+        
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            max-width: 400px;
+            font-family: monospace;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+
+        .debug-info {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            color: lime;
+            background: rgba(0,0,0,0.9);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-family: monospace;
+            max-width: 300px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div class="info" id="info">Loading GLB model...</div>
+    <div class="debug-info" id="debug">
+        Debug Info:<br>
+        Vertices: <span id="vertex-count">0</span><br>
+        Draw calls: <span id="draw-calls">0</span><br>
+        Camera: <span id="camera-info">--</span><br>
+        Model visible: <span id="model-visible">Unknown</span>
+    </div>
+    <div class="controls">
+        <div><strong>Controls:</strong></div>
+        <div>Mouse: Rotate camera</div>
+        <div>Wheel: Zoom in/out</div>
+        <div>R: Reset view</div>
+        <div>L: Toggle wireframe</div>
+        <div>B: Toggle bright mode</div>
+        <div>D: Disable face culling</div>
+    </div>
+
+    <script>
+        let gl, program, positionBuffer, normalBuffer, indexBuffer;
+        let modelMatrix = mat4_identity();
+        let viewMatrix = mat4_identity();
+        let projectionMatrix = mat4_identity();
+        let normalMatrix = mat4_identity();
+        let rotation = 0;
+        
+        // Camera controls
+        let cameraDistance = 5;
+        let cameraRotationX = 0;
+        let cameraRotationY = 0;
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+        
+        // Debug flags
+        let wireframeMode = false;
+        let brightMode = false;
+        let cullFaces = true;
+        let drawCallCount = 0;
+        
+        // Enhanced vertex shader with better lighting
+        const vertexShaderSource = `
+            precision mediump float;
+            attribute vec3 a_position;
+            attribute vec3 a_normal;
+            uniform mat4 u_model;
+            uniform mat4 u_view;
+            uniform mat4 u_projection;
+            uniform mat4 u_normalMatrix;
+            uniform vec3 u_lightDirection;
+            uniform vec3 u_viewPosition;
+            uniform float u_brightMode;
+            
+            varying vec3 v_normal;
+            varying vec3 v_position;
+            varying vec3 v_lighting;
+            
+            void main() {
+                vec4 worldPosition = u_model * vec4(a_position, 1.0);
+                gl_Position = u_projection * u_view * worldPosition;
+                
+                v_normal = normalize((u_normalMatrix * vec4(a_normal, 0.0)).xyz);
+                v_position = worldPosition.xyz;
+                
+                // Enhanced lighting calculation
+                vec3 lightDir = normalize(u_lightDirection);
+                float NdotL = max(dot(v_normal, lightDir), 0.0);
+                
+                // Multiple light sources for better visibility
+                vec3 lightDir2 = normalize(vec3(-0.5, 0.8, -0.3));
+                float NdotL2 = max(dot(v_normal, lightDir2), 0.0);
+                
+                vec3 lightDir3 = normalize(vec3(0.0, -1.0, 0.5));
+                float NdotL3 = max(dot(v_normal, lightDir3), 0.0);
+                
+                // Bright ambient lighting
+                vec3 ambient = vec3(0.6, 0.6, 0.7);
+                vec3 diffuse1 = vec3(1.0, 0.9, 0.8) * NdotL;
+                vec3 diffuse2 = vec3(0.5, 0.7, 1.0) * NdotL2;
+                vec3 diffuse3 = vec3(0.8, 0.6, 0.4) * NdotL3;
+                
+                // Rim lighting for edge definition
+                vec3 viewDir = normalize(u_viewPosition - v_position);
+                float rim = 1.0 - max(dot(viewDir, v_normal), 0.0);
+                vec3 rimLight = vec3(0.3, 0.4, 0.5) * pow(rim, 1.5);
+                
+                v_lighting = ambient + diffuse1 + diffuse2 * 0.5 + diffuse3 * 0.3 + rimLight;
+                
+                // Bright mode boost
+                if (u_brightMode > 0.5) {
+                    v_lighting *= 2.0;
+                }
+            }
+        `;
+        
+        // Enhanced fragment shader
+        const fragmentShaderSource = `
+            precision mediump float;
+            varying vec3 v_normal;
+            varying vec3 v_position;
+            varying vec3 v_lighting;
+            uniform float u_brightMode;
+            
+            void main() {
+                // More visible base color
+                vec3 baseColor = vec3(0.8, 0.6, 0.4);
+                
+                if (u_brightMode > 0.5) {
+                    // Super bright mode
+                    baseColor = vec3(1.0, 0.8, 0.6);
+                }
+                
+                // Ensure high minimum brightness
+                vec3 finalColor = baseColor * max(v_lighting, vec3(0.5));
+                
+                // Add some color variation based on normal
+                finalColor += abs(v_normal) * 0.2;
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        function initWebGL() {
+            const canvas = document.getElementById('canvas');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            
+            gl = canvas.getContext('webgl');
+            if (!gl) {
+                updateInfo('❌ WebGL not supported');
+                return false;
+            }
+            
+            updateInfo('✅ WebGL initialized');
+            
+            program = createShaderProgram(gl, vertexShaderSource, fragmentShaderSource);
+            if (!program) {
+                updateInfo('❌ Shader compilation failed');
+                return false;
+            }
+            
+            gl.useProgram(program);
+            
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.enable(gl.DEPTH_TEST);
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.BACK);
+            gl.clearColor(0.1, 0.1, 0.2, 1.0);
+            
+            const aspect = canvas.width / canvas.height;
+            projectionMatrix = mat4_perspective(45 * Math.PI / 180, aspect, 0.1, 1000.0);
+            
+            updateViewMatrix();
+            
+            positionBuffer = gl.createBuffer();
+            normalBuffer = gl.createBuffer();
+            indexBuffer = gl.createBuffer();
+            
+            setupControls(canvas);
+            
+            return true;
+        }
+        
+        function updateInfo(message) {
+            document.getElementById('info').innerHTML = message;
+        }
+
+        function updateDebugInfo() {
+            document.getElementById('vertex-count').textContent = window.vertexCount || 0;
+            document.getElementById('draw-calls').textContent = drawCallCount;
+            
+            const dist = cameraDistance.toFixed(1);
+            const rotX = (cameraRotationX * 180 / Math.PI).toFixed(0);
+            const rotY = (cameraRotationY * 180 / Math.PI).toFixed(0);
+            document.getElementById('camera-info').textContent = `dist:${dist} x:${rotX}° y:${rotY}°`;
+            
+            document.getElementById('model-visible').textContent = window.vertexCount > 0 ? 'YES' : 'NO';
+        }
+        
+        function setupControls(canvas) {
+            canvas.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            });
+            
+            canvas.addEventListener('mousemove', (e) => {
+                if (isDragging) {
+                    const deltaX = e.clientX - lastMouseX;
+                    const deltaY = e.clientY - lastMouseY;
+                    
+                    cameraRotationY += deltaX * 0.01;
+                    cameraRotationX += deltaY * 0.01;
+                    
+                    cameraRotationX = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, cameraRotationX));
+                    
+                    lastMouseX = e.clientX;
+                    lastMouseY = e.clientY;
+                    
+                    updateViewMatrix();
+                }
+            });
+            
+            canvas.addEventListener('mouseup', () => {
+                isDragging = false;
+            });
+            
+            canvas.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                cameraDistance += e.deltaY * 0.01;
+                cameraDistance = Math.max(0.1, Math.min(100, cameraDistance));
+                updateViewMatrix();
+            });
+            
+            window.addEventListener('keydown', (e) => {
+                switch(e.key.toLowerCase()) {
+                    case 'r':
+                        cameraDistance = 5;
+                        cameraRotationX = 0;
+                        cameraRotationY = 0;
+                        updateViewMatrix();
+                        break;
+                    case 'l':
+                        wireframeMode = !wireframeMode;
+                        updateInfo(`Wireframe: ${wireframeMode ? 'ON' : 'OFF'}`);
+                        break;
+                    case 'b':
+                        brightMode = !brightMode;
+                        updateInfo(`Bright mode: ${brightMode ? 'ON' : 'OFF'}`);
+                        break;
+                    case 'd':
+                        cullFaces = !cullFaces;
+                        if (cullFaces) {
+                            gl.enable(gl.CULL_FACE);
+                        } else {
+                            gl.disable(gl.CULL_FACE);
+                        }
+                        updateInfo(`Face culling: ${cullFaces ? 'ON' : 'OFF'}`);
+                        break;
+                }
+            });
+        }
+        
+        function updateViewMatrix() {
+            const x = cameraDistance * Math.sin(cameraRotationY) * Math.cos(cameraRotationX);
+            const y = cameraDistance * Math.sin(cameraRotationX);
+            const z = cameraDistance * Math.cos(cameraRotationY) * Math.cos(cameraRotationX);
+            
+            viewMatrix = mat4_lookAt([x, y, z], [0, 0, 0], [0, 1, 0]);
+        }
+        
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            
+            return shader;
+        }
+        
+        function createShaderProgram(gl, vertexSource, fragmentSource) {
+            const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexSource);
+            const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+            
+            if (!vertexShader || !fragmentShader) return null;
+            
+            const program = gl.createProgram();
+            gl.attachShader(program, vertexShader);
+            gl.attachShader(program, fragmentShader);
+            gl.linkProgram(program);
+            
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error('Program link error:', gl.getProgramInfoLog(program));
+                return null;
+            }
+            
+            return program;
+        }
+        
+        async function loadGLBModel(url = './model.glb') {
+            try {
+                updateInfo('📥 Fetching GLB model...');
+                
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                updateInfo('🔄 Parsing GLB data...');
+                const arrayBuffer = await response.arrayBuffer();
+                const gltfData = parseGLB(arrayBuffer);
+                
+                if (gltfData && gltfData.meshes && gltfData.meshes.length > 0) {
+                    createMeshBuffers(gltfData);
+                    updateInfo(`✅ GLB loaded! Vertices: ${window.vertexCount} | Press B for bright mode`);
+                } else {
+                    createFallbackCube();
+                    updateInfo('📦 No mesh data found, showing test cube');
+                }
+                
+            } catch (error) {
+                console.error('❌ GLB loading failed:', error);
+                updateInfo(`❌ GLB failed: ${error.message}`);
+                createFallbackCube();
+            }
+        }
+        
+        function parseGLB(arrayBuffer) {
+            try {
+                const view = new DataView(arrayBuffer);
+                
+                const magic = view.getUint32(0, true);
+                const version = view.getUint32(4, true);
+                const length = view.getUint32(8, true);
+                
+                if (magic !== 0x46546C67) {
+                    throw new Error('Not a valid GLB file');
+                }
+                
+                const jsonChunkLength = view.getUint32(12, true);
+                const jsonChunkType = view.getUint32(16, true);
+                
+                if (jsonChunkType !== 0x4E4F534A) {
+                    throw new Error('Expected JSON chunk');
+                }
+                
+                const jsonBytes = new Uint8Array(arrayBuffer, 20, jsonChunkLength);
+                const jsonString = new TextDecoder().decode(jsonBytes);
+                const gltf = JSON.parse(jsonString);
+                
+                const binChunkOffset = 20 + jsonChunkLength;
+                let binaryData = null;
+                
+                if (binChunkOffset < arrayBuffer.byteLength) {
+                    const binChunkLength = view.getUint32(binChunkOffset, true);
+                    const binChunkType = view.getUint32(binChunkOffset + 4, true);
+                    
+                    if (binChunkType === 0x004E4942) {
+                        binaryData = new Uint8Array(arrayBuffer, binChunkOffset + 8, binChunkLength);
+                    }
+                }
+                
+                gltf.binaryData = binaryData;
+                return gltf;
+                
+            } catch (error) {
+                console.error('GLB parsing error:', error);
+                return null;
+            }
+        }
+        
+        function createMeshBuffers(gltf) {
+            try {
+                const mesh = gltf.meshes[0];
+                const primitive = mesh.primitives[0];
+                
+                const positionAccessor = gltf.accessors[primitive.attributes.POSITION];
+                const positionBufferView = gltf.bufferViews[positionAccessor.bufferView];
+                const positionOffset = (positionBufferView.byteOffset || 0) + (positionAccessor.byteOffset || 0);
+                const positionData = new Float32Array(
+                    gltf.binaryData.buffer,
+                    gltf.binaryData.byteOffset + positionOffset,
+                    positionAccessor.count * 3
+                );
+                
+                let normalData;
+                if (primitive.attributes.NORMAL !== undefined) {
+                    const normalAccessor = gltf.accessors[primitive.attributes.NORMAL];
+                    const normalBufferView = gltf.bufferViews[normalAccessor.bufferView];
+                    const normalOffset = (normalBufferView.byteOffset || 0) + (normalAccessor.byteOffset || 0);
+                    
+                    normalData = new Float32Array(
+                        gltf.binaryData.buffer,
+                        gltf.binaryData.byteOffset + normalOffset,
+                        normalAccessor.count * 3
+                    );
+                } else {
+                    normalData = generateNormals(positionData);
+                }
+                
+                gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, positionData, gl.STATIC_DRAW);
+                
+                gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, normalData, gl.STATIC_DRAW);
+                
+                if (primitive.indices !== undefined) {
+                    const indexAccessor = gltf.accessors[primitive.indices];
+                    const indexBufferView = gltf.bufferViews[indexAccessor.bufferView];
+                    const indexOffset = (indexBufferView.byteOffset || 0) + (indexAccessor.byteOffset || 0);
+                    
+                    let indexData;
+                    if (indexAccessor.componentType === 5123) {
+                        indexData = new Uint16Array(
+                            gltf.binaryData.buffer,
+                            gltf.binaryData.byteOffset + indexOffset,
+                            indexAccessor.count
+                        );
+                    } else if (indexAccessor.componentType === 5125) {
+                        indexData = new Uint32Array(
+                            gltf.binaryData.buffer,
+                            gltf.binaryData.byteOffset + indexOffset,
+                            indexAccessor.count
+                        );
+                    }
+                    
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+                    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indexData, gl.STATIC_DRAW);
+                    
+                    window.indexCount = indexAccessor.count;
+                    window.hasIndices = true;
+                } else {
+                    window.hasIndices = false;
+                }
+                
+                window.vertexCount = positionAccessor.count;
+                
+                const bounds = calculateBounds(positionData);
+                const maxDimension = Math.max(bounds.width, bounds.height, bounds.depth);
+                window.modelScale = maxDimension > 0 ? 2.0 / maxDimension : 1.0;
+                window.modelCenter = [bounds.centerX, bounds.centerY, bounds.centerZ];
+                
+            } catch (error) {
+                console.error('Error extracting mesh data:', error);
+                createFallbackCube();
+            }
+        }
+        
+        function generateNormals(positions) {
+            const normals = new Float32Array(positions.length);
+            
+            for (let i = 0; i < positions.length; i += 9) {
+                const v1 = [positions[i], positions[i+1], positions[i+2]];
+                const v2 = [positions[i+3], positions[i+4], positions[i+5]];
+                const v3 = [positions[i+6], positions[i+7], positions[i+8]];
+                
+                const edge1 = subtract(v2, v1);
+                const edge2 = subtract(v3, v1);
+                const normal = normalize(cross(edge1, edge2));
+                
+                for (let j = 0; j < 3; j++) {
+                    normals[i + j*3] = normal[0];
+                    normals[i + j*3 + 1] = normal[1];
+                    normals[i + j*3 + 2] = normal[2];
+                }
+            }
+            
+            return normals;
+        }
+        
+        function calculateBounds(positions) {
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            let minZ = Infinity, maxZ = -Infinity;
+            
+            for (let i = 0; i < positions.length; i += 3) {
+                minX = Math.min(minX, positions[i]);
+                maxX = Math.max(maxX, positions[i]);
+                minY = Math.min(minY, positions[i + 1]);
+                maxY = Math.max(maxY, positions[i + 1]);
+                minZ = Math.min(minZ, positions[i + 2]);
+                maxZ = Math.max(maxZ, positions[i + 2]);
+            }
+            
+            return {
+                width: maxX - minX,
+                height: maxY - minY,
+                depth: maxZ - minZ,
+                centerX: (minX + maxX) / 2,
+                centerY: (minY + maxY) / 2,
+                centerZ: (minZ + maxZ) / 2
+            };
+        }
+        
+        function createFallbackCube() {
+            const vertices = [
+                -1, -1,  1,   1, -1,  1,   1,  1,  1,
+                -1, -1,  1,   1,  1,  1,  -1,  1,  1,
+                -1, -1, -1,  -1,  1, -1,   1,  1, -1,
+                -1, -1, -1,   1,  1, -1,   1, -1, -1,
+                -1,  1, -1,  -1,  1,  1,   1,  1,  1,
+                -1,  1, -1,   1,  1,  1,   1,  1, -1,
+                -1, -1, -1,   1, -1, -1,   1, -1,  1,
+                -1, -1, -1,   1, -1,  1,  -1, -1,  1,
+                 1, -1, -1,   1,  1, -1,   1,  1,  1,
+                 1, -1, -1,   1,  1,  1,   1, -1,  1,
+                -1, -1, -1,  -1, -1,  1,  -1,  1,  1,
+                -1, -1, -1,  -1,  1,  1,  -1,  1, -1
+            ];
+            
+            const normals = [
+                0, 0, 1,  0, 0, 1,  0, 0, 1,
+                0, 0, 1,  0, 0, 1,  0, 0, 1,
+                0, 0, -1,  0, 0, -1,  0, 0, -1,
+                0, 0, -1,  0, 0, -1,  0, 0, -1,
+                0, 1, 0,  0, 1, 0,  0, 1, 0,
+                0, 1, 0,  0, 1, 0,  0, 1, 0,
+                0, -1, 0,  0, -1, 0,  0, -1, 0,
+                0, -1, 0,  0, -1, 0,  0, -1, 0,
+                1, 0, 0,  1, 0, 0,  1, 0, 0,
+                1, 0, 0,  1, 0, 0,  1, 0, 0,
+                -1, 0, 0,  -1, 0, 0,  -1, 0, 0,
+                -1, 0, 0,  -1, 0, 0,  -1, 0, 0
+            ];
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normals), gl.STATIC_DRAW);
+            
+            window.vertexCount = 36;
+            window.modelScale = 1.0;
+            window.modelCenter = [0, 0, 0];
+            window.hasIndices = false;
+        }
+        
+        function render() {
+            drawCallCount = 0;
+            
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            
+            rotation += 0.005;
+            
+            let scaleMatrix = mat4_scale(window.modelScale || 1.0);
+            let centerMatrix = mat4_translate(
+                -(window.modelCenter?.[0] || 0),
+                -(window.modelCenter?.[1] || 0),
+                -(window.modelCenter?.[2] || 0)
+            );
+            let rotationMatrix = mat4_rotationY(rotation);
+            
+            modelMatrix = mat4_multiply(rotationMatrix, mat4_multiply(scaleMatrix, centerMatrix));
+            normalMatrix = mat4_transpose(mat4_invert(modelMatrix));
+            
+            const modelLoc = gl.getUniformLocation(program, 'u_model');
+            const viewLoc = gl.getUniformLocation(program, 'u_view');
+            const projLoc = gl.getUniformLocation(program, 'u_projection');
+            const normalMatrixLoc = gl.getUniformLocation(program, 'u_normalMatrix');
+            const lightDirLoc = gl.getUniformLocation(program, 'u_lightDirection');
+            const viewPosLoc = gl.getUniformLocation(program, 'u_viewPosition');
+            const brightModeLoc = gl.getUniformLocation(program, 'u_brightMode');
+            
+            gl.uniformMatrix4fv(modelLoc, false, modelMatrix);
+            gl.uniformMatrix4fv(viewLoc, false, viewMatrix);
+            gl.uniformMatrix4fv(projLoc, false, projectionMatrix);
+            gl.uniformMatrix4fv(normalMatrixLoc, false, normalMatrix);
+            gl.uniform3fv(lightDirLoc, [0.5, 1.0, 0.8]);
+            gl.uniform1f(brightModeLoc, brightMode ? 1.0 : 0.0);
+            
+            const x = cameraDistance * Math.sin(cameraRotationY) * Math.cos(cameraRotationX);
+            const y = cameraDistance * Math.sin(cameraRotationX);
+            const z = cameraDistance * Math.cos(cameraRotationY) * Math.cos(cameraRotationX);
+            gl.uniform3fv(viewPosLoc, [x, y, z]);
+            
+            const positionLoc = gl.getAttribLocation(program, 'a_position');
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.enableVertexAttribArray(positionLoc);
+            gl.vertexAttribPointer(positionLoc, 3, gl.FLOAT, false, 0, 0);
+            
+            const normalLoc = gl.getAttribLocation(program, 'a_normal');
+            gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+            gl.enableVertexAttribArray(normalLoc);
+            gl.vertexAttribPointer(normalLoc, 3, gl.FLOAT, false, 0, 0);
+            
+            if (window.vertexCount) {
+                if (window.hasIndices) {
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+                    if (wireframeMode) {
+                        // Note: wireframe mode would need gl.LINES and index conversion
+                        gl.drawElements(gl.TRIANGLES, window.indexCount, gl.UNSIGNED_SHORT, 0);
+                    } else {
+                        gl.drawElements(gl.TRIANGLES, window.indexCount, gl.UNSIGNED_SHORT, 0);
+                    }
+                } else {
+                    if (wireframeMode) {
+                        // Simple wireframe approximation
+                        for (let i = 0; i < window.vertexCount; i += 3) {
+                            gl.drawArrays(gl.LINE_LOOP, i, 3);
+                        }
+                    } else {
+                        gl.drawArrays(gl.TRIANGLES, 0, window.vertexCount);
+                    }
+                }
+                drawCallCount++;
+            }
+            
+            updateDebugInfo();
+            requestAnimationFrame(render);
+        }
+        
+        // Matrix math functions
+        function mat4_identity() {
+            return new Float32Array([
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1
+            ]);
+        }
+        
+        function mat4_perspective(fov, aspect, near, far) {
+            const f = Math.tan(Math.PI * 0.5 - 0.5 * fov);
+            const rangeInv = 1.0 / (near - far);
+            
+            return new Float32Array([
+                f / aspect, 0, 0, 0,
+                0, f, 0, 0,
+                0, 0, (near + far) * rangeInv, -1,
+                0, 0, near * far * rangeInv * 2, 0
+            ]);
+        }
+        
+        function mat4_lookAt(eye, target, up) {
+            const zAxis = normalize(subtract(eye, target));
+            const xAxis = normalize(cross(up, zAxis));
+            const yAxis = normalize(cross(zAxis, xAxis));
+            
+            return new Float32Array([
+                xAxis[0], yAxis[0], zAxis[0], 0,
+                xAxis[1], yAxis[1], zAxis[1], 0,
+                xAxis[2], yAxis[2], zAxis[2], 0,
+                -dot(xAxis, eye), -dot(yAxis, eye), -dot(zAxis, eye), 1,
+            ]);
+        }
+        
+        function mat4_rotationY(angle) {
+            const c = Math.cos(angle);
+            const s = Math.sin(angle);
+            
+            return new Float32Array([
+                c, 0, s, 0,
+                0, 1, 0, 0,
+                -s, 0, c, 0,
+                0, 0, 0, 1
+            ]);
+        }
+        
+        function mat4_scale(s) {
+            return new Float32Array([
+                s, 0, 0, 0,
+                0, s, 0, 0,
+                0, 0, s, 0,
+                0, 0, 0, 1
+            ]);
+        }
+        
+        function mat4_translate(x, y, z) {
+            return new Float32Array([
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                x, y, z, 1
+            ]);
+        }
+        
+        function mat4_multiply(a, b) {
+            const result = new Float32Array(16);
+            for (let i = 0; i < 4; i++) {
+                for (let j = 0; j < 4; j++) {
+                    result[i * 4 + j] = 
+                        a[i * 4 + 0] * b[0 * 4 + j] +
+                        a[i * 4 + 1] * b[1 * 4 + j] +
+                        a[i * 4 + 2] * b[2 * 4 + j] +
+                        a[i * 4 + 3] * b[3 * 4 + j];
+                }
+            }
+            return result;
+        }
+        
+        function mat4_invert(m) {
+            const result = new Float32Array(16);
+            
+            result[0] = m[0]; result[1] = m[4]; result[2] = m[8]; result[3] = 0;
+            result[4] = m[1]; result[5] = m[5]; result[6] = m[9]; result[7] = 0;
+            result[8] = m[2]; result[9] = m[6]; result[10] = m[10]; result[11] = 0;
+            result[12] = 0; result[13] = 0; result[14] = 0; result[15] = 1;
+            
+            return result;
+        }
+        
+        function mat4_transpose(m) {
+            return new Float32Array([
+                m[0], m[4], m[8], m[12],
+                m[1], m[5], m[9], m[13],
+                m[2], m[6], m[10], m[14],
+                m[3], m[7], m[11], m[15]
+            ]);
+        }
+        
+        // Vector math helpers
+        function subtract(a, b) {
+            return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        }
+        
+        function cross(a, b) {
+            return [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0]
+            ];
+        }
+        
+        function dot(a, b) {
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        }
+        
+        function normalize(v) {
+            const length = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (length === 0) return [0, 0, 1];
+            return [v[0] / length, v[1] / length, v[2] / length];
+        }
+        
+        function handleResize() {
+            const canvas = document.getElementById('canvas');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            
+            if (gl) {
+                gl.viewport(0, 0, canvas.width, canvas.height);
+                const aspect = canvas.width / canvas.height;
+                projectionMatrix = mat4_perspective(45 * Math.PI / 180, aspect, 0.1, 1000.0);
+            }
+        }
+        
+        window.addEventListener('load', () => {
+            if (initWebGL()) {
+                console.log('Debug GLB loader initialized');
+                loadGLBModel('./model.glb');
+                render();
+            }
+        });
+        
+        window.addEventListener('resize', handleResize);
+    </script>
+</body>
+</html>
